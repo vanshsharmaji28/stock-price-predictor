@@ -106,15 +106,23 @@ def train_model(ticker: str):
 
     try:
         logger.info(f"Starting training for {ticker}")
+
         df = fetch_stock_data(ticker, period="3y")
         feature_cols = get_available_features(df)
-        train_df, test_df = train_test_split_temporal(df, test_ratio=0.15)
+        train_df, test_df = train_test_split_temporal(
+            df,
+            test_ratio=0.15
+        )
 
         model = StockLSTMModel(
             sequence_length=sequence_length,
             units=[128, 64],
             dropout_rate=0.2,
         )
+
+        # Force build before training
+        model.build_model()
+
         history = model.fit(
             train_df,
             feature_cols=feature_cols,
@@ -124,23 +132,35 @@ def train_model(ticker: str):
         )
 
         metrics = model.evaluate(test_df)
-        model.save(os.path.join(MODEL_DIR, ticker))
+
+        model.save(
+            os.path.join(MODEL_DIR, ticker)
+        )
+
         _model_cache[ticker] = model
 
         return jsonify({
             "ticker": ticker,
             "status": "trained",
             "epochs_run": len(history.get("loss", [])),
-            "final_train_loss": round(history["loss"][-1], 6),
-            "final_val_loss": round(history["val_loss"][-1], 6),
+            "final_train_loss": round(
+                history["loss"][-1], 6
+            ),
+            "final_val_loss": round(
+                history["val_loss"][-1], 6
+            ),
             "test_metrics": metrics,
             "features_used": len(feature_cols),
+            "model_params": model.model.count_params()
         })
+
     except Exception as e:
-        logger.exception(f"Training failed for {ticker}")
-        return jsonify({"error": str(e)}), 500
-
-
+        logger.exception(
+            f"Training failed for {ticker}"
+        )
+        return jsonify({
+            "error": str(e)
+        }), 500
 @app.route("/api/stock/<ticker>/predict")
 def predict(ticker: str):
     """Return next-day price prediction."""
