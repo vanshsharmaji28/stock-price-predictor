@@ -23,11 +23,6 @@ logger = logging.getLogger(__name__)
 class StockLSTMModel:
     """
     Bidirectional LSTM model for stock price prediction.
-    
-    Architecture:
-        - 2x Bidirectional LSTM layers with dropout
-        - BatchNormalization for stable training
-        - Dense output layer for next-day price prediction
     """
 
     def __init__(
@@ -44,7 +39,6 @@ class StockLSTMModel:
         self.dropout_rate = dropout_rate
         self.learning_rate = learning_rate
         self.model = None
-        self.scaler = MinMaxScaler(feature_range=(0, 1))
         self.feature_scaler = MinMaxScaler(feature_range=(0, 1))
         self.history = None
         self.feature_columns = []
@@ -83,10 +77,20 @@ class StockLSTMModel:
         model.add(Dense(1, activation="linear", name="output"))
 
         optimizer = Adam(learning_rate=self.learning_rate)
-        model.compile(optimizer=optimizer, loss="huber", metrics=["mae"])
+        model.compile(
+            optimizer=optimizer,
+            loss="huber",
+            metrics=["mae"]
+        )
+
+        # Explicitly build model before any parameter access
+        model.build(
+            input_shape=(None, self.sequence_length, self.n_features)
+        )
 
         self.model = model
-        logger.info(f"Model built: {model.count_params():,} parameters")
+        logger.info("Model built successfully")
+
         return model
 
     def prepare_sequences(
@@ -95,8 +99,9 @@ class StockLSTMModel:
         """Create sliding window sequences for LSTM input."""
         X, y = [], []
         for i in range(self.sequence_length, len(data)):
-            X.append(data[i - self.sequence_length : i])
+            X.append(data[i - self.sequence_length: i])
             y.append(data[i, target_col_idx])
+
         return np.array(X), np.array(y)
 
     def fit(
@@ -109,21 +114,7 @@ class StockLSTMModel:
         validation_split: float = 0.15,
         model_dir: str = "saved_models",
     ) -> dict:
-        """
-        Train the LSTM model on stock data.
-        
-        Args:
-            df: DataFrame with OHLCV + technical indicators
-            feature_cols: List of feature column names
-            target_col: Target column to predict
-            epochs: Max training epochs
-            batch_size: Mini-batch size
-            validation_split: Fraction for validation
-            model_dir: Directory to save best model
-        
-        Returns:
-            Training history dict
-        """
+        """Train the model."""
         self.feature_columns = feature_cols
         self.n_features = len(feature_cols)
 
@@ -131,15 +122,20 @@ class StockLSTMModel:
         scaled_features = self.feature_scaler.fit_transform(df[feature_cols])
         target_idx = feature_cols.index(target_col)
 
-        # Build sequences
-        X, y = self.prepare_sequences(scaled_features, target_col_idx=target_idx)
+        # Create sequences
+        X, y = self.prepare_sequences(
+            scaled_features,
+            target_col_idx=target_idx
+        )
+
         logger.info(f"Training sequences: X={X.shape}, y={y.shape}")
 
-        # Rebuild model with correct feature count
+        # Build model
         self.build_model()
 
         # Callbacks
         os.makedirs(model_dir, exist_ok=True)
+
         callbacks = [
             EarlyStopping(
                 monitor="val_loss",
@@ -155,7 +151,10 @@ class StockLSTMModel:
                 verbose=1,
             ),
             ModelCheckpoint(
-                filepath=os.path.join(model_dir, "best_model.keras"),
+                filepath=os.path.join(
+                    model_dir,
+                    "best_model.keras"
+                ),
                 monitor="val_loss",
                 save_best_only=True,
                 verbose=0,
@@ -170,54 +169,76 @@ class StockLSTMModel:
             validation_split=validation_split,
             callbacks=callbacks,
             verbose=1,
-            shuffle=False,  # Time series — no shuffling
+            shuffle=False,
         )
 
         return self.history.history
 
     def predict_next_day(self, df: pd.DataFrame) -> dict:
-        """
-        Predict the next trading day's closing price.
-        
-        Returns:
-            dict with predicted price, confidence interval, and direction
-        """
+        """Predict next day's closing price."""
         if self.model is None:
-            raise RuntimeError("Model not trained. Call fit() first.")
+            raise RuntimeError(
+                "Model not trained. Call fit() first."
+            )
 
-        recent = df[self.feature_columns].tail(self.sequence_length)
+        recent = df[self.feature_columns].tail(
+            self.sequence_length
+        )
+
         if len(recent) < self.sequence_length:
             raise ValueError(
-                f"Need at least {self.sequence_length} rows, got {len(recent)}"
+                f"Need at least {self.sequence_length} rows"
             )
 
         scaled = self.feature_scaler.transform(recent)
-        X = scaled.reshape(1, self.sequence_length, self.n_features)
 
-        pred_scaled = self.model.predict(X, verbose=0)[0, 0]
+        X = scaled.reshape(
+            1,
+            self.sequence_length,
+            self.n_features
+        )
 
-        # Inverse transform using Close column position
-        dummy = np.zeros((1, self.n_features))
+        pred_scaled = self.model.predict(
+            X,
+            verbose=0
+        )[0, 0]
+
         close_idx = self.feature_columns.index("Close")
-        dummy[0, close_idx] = pred_scaled
-        pred_price = self.feature_scaler.inverse_transform(dummy)[0, close_idx]
 
-        # Monte Carlo Dropout for uncertainty estimation
+        dummy = np.zeros((1, self.n_features))
+        dummy[0, close_idx] = pred_scaled
+
+        pred_price = self.feature_scaler.inverse_transform(
+            dummy
+        )[0, close_idx]
+
+        # Monte Carlo Dropout for uncertainty
         mc_predictions = []
+
         for _ in range(50):
-            p = self.model(X, training=True).numpy()[0, 0]
+            p = self.model(
+                X,
+                training=True
+            ).numpy()[0, 0]
+
             dummy2 = np.zeros((1, self.n_features))
             dummy2[0, close_idx] = p
+
             mc_predictions.append(
-                self.feature_scaler.inverse_transform(dummy2)[0, close_idx]
+                self.feature_scaler.inverse_transform(
+                    dummy2
+                )[0, close_idx]
             )
 
         mc_predictions = np.array(mc_predictions)
+
         lower = np.percentile(mc_predictions, 5)
         upper = np.percentile(mc_predictions, 95)
 
         last_close = df["Close"].iloc[-1]
-        change_pct = ((pred_price - last_close) / last_close) * 100
+        change_pct = (
+            (pred_price - last_close) / last_close
+        ) * 100
 
         return {
             "predicted_price": float(pred_price),
@@ -230,47 +251,92 @@ class StockLSTMModel:
         }
 
     def evaluate(self, df: pd.DataFrame) -> dict:
-        """Evaluate model performance on a test set."""
+        """Evaluate model performance."""
         feature_cols = self.feature_columns
-        scaled = self.feature_scaler.transform(df[feature_cols])
-        X, y_true_scaled = self.prepare_sequences(
-            scaled, target_col_idx=feature_cols.index("Close")
+
+        scaled = self.feature_scaler.transform(
+            df[feature_cols]
         )
 
-        y_pred_scaled = self.model.predict(X, verbose=0).flatten()
+        X, y_true_scaled = self.prepare_sequences(
+            scaled,
+            target_col_idx=feature_cols.index("Close")
+        )
 
-        # Inverse transform
+        y_pred_scaled = self.model.predict(
+            X,
+            verbose=0
+        ).flatten()
+
         close_idx = feature_cols.index("Close")
         n = self.n_features
 
         def inv(vals):
             dummy = np.zeros((len(vals), n))
             dummy[:, close_idx] = vals
-            return self.feature_scaler.inverse_transform(dummy)[:, close_idx]
+            return self.feature_scaler.inverse_transform(
+                dummy
+            )[:, close_idx]
 
         y_true = inv(y_true_scaled)
         y_pred = inv(y_pred_scaled)
 
         return {
-            "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-            "r2": float(r2_score(y_true, y_pred)),
+            "rmse": float(
+                np.sqrt(
+                    mean_squared_error(
+                        y_true,
+                        y_pred
+                    )
+                )
+            ),
+            "mae": float(
+                mean_absolute_error(
+                    y_true,
+                    y_pred
+                )
+            ),
+            "r2": float(
+                r2_score(
+                    y_true,
+                    y_pred
+                )
+            ),
             "mape": float(
-                np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+                np.mean(
+                    np.abs(
+                        (y_true - y_pred) /
+                        (y_true + 1e-8)
+                    )
+                ) * 100
             ),
             "directional_accuracy": float(
                 np.mean(
-                    np.sign(np.diff(y_true)) == np.sign(np.diff(y_pred))
-                )
-                * 100
+                    np.sign(np.diff(y_true)) ==
+                    np.sign(np.diff(y_pred))
+                ) * 100
             ),
         }
 
     def save(self, path: str):
-        """Save model + scaler to disk."""
+        """Save model and scaler."""
         os.makedirs(path, exist_ok=True)
-        self.model.save(os.path.join(path, "lstm_model.keras"))
-        joblib.dump(self.feature_scaler, os.path.join(path, "feature_scaler.pkl"))
+
+        self.model.save(
+            os.path.join(
+                path,
+                "lstm_model.keras"
+            )
+        )
+
+        joblib.dump(
+            self.feature_scaler,
+            os.path.join(
+                path,
+                "feature_scaler.pkl"
+            )
+        )
+
         metadata = {
             "sequence_length": self.sequence_length,
             "n_features": self.n_features,
@@ -278,15 +344,27 @@ class StockLSTMModel:
             "units": self.units,
             "dropout_rate": self.dropout_rate,
         }
-        pd.Series(metadata).to_json(os.path.join(path, "metadata.json"))
+
+        pd.Series(metadata).to_json(
+            os.path.join(
+                path,
+                "metadata.json"
+            )
+        )
+
         logger.info(f"Model saved to {path}")
 
     @classmethod
-    def load(cls, path: str) -> "StockLSTMModel":
-        """Load a saved model from disk."""
+    def load(cls, path: str):
+        """Load saved model."""
         import json
 
-        with open(os.path.join(path, "metadata.json")) as f:
+        with open(
+            os.path.join(
+                path,
+                "metadata.json"
+            )
+        ) as f:
             meta = json.load(f)
 
         obj = cls(
@@ -295,8 +373,23 @@ class StockLSTMModel:
             units=meta["units"],
             dropout_rate=meta["dropout_rate"],
         )
+
         obj.feature_columns = meta["feature_columns"]
-        obj.model = load_model(os.path.join(path, "lstm_model.keras"))
-        obj.feature_scaler = joblib.load(os.path.join(path, "feature_scaler.pkl"))
+
+        obj.model = load_model(
+            os.path.join(
+                path,
+                "lstm_model.keras"
+            )
+        )
+
+        obj.feature_scaler = joblib.load(
+            os.path.join(
+                path,
+                "feature_scaler.pkl"
+            )
+        )
+
         logger.info(f"Model loaded from {path}")
+
         return obj
